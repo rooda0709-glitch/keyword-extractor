@@ -20,7 +20,7 @@ st.set_page_config(page_title="AI 검색광고 키워드 추출기 v7", page_ico
 NAVER_API_BASE = "https://api.searchad.naver.com"
 
 PURPOSES = [
-    "네이버 파워링크 신규 세팅",
+    "네이버 파워링크 신규세팅",
     "기존 파워링크 키워드 확장",
     "쇼핑검색광고 키워드 발굴",
     "시장/경쟁사 키워드 조사",
