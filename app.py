@@ -6,6 +6,7 @@ import io
 import json
 import re
 import time
+import random
 from collections import deque
 from urllib.parse import urljoin, urlparse, urldefrag
 
@@ -13,9 +14,9 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError
 
-st.set_page_config(page_title="AI 검색광고 키워드 추출기 v8", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="AI 검색광고 키워드 추출기 v9", page_icon="🤖", layout="wide")
 
 NAVER_API_BASE = "https://api.searchad.naver.com"
 
@@ -258,10 +259,7 @@ def analyze_site_with_ai(pages, openai_key, model, purpose, user_hint=""):
 SITE_DATA:
 {json.dumps(packet, ensure_ascii=False)}
 """
-    resp = client.responses.create(model=model, input=prompt)
-    text = resp.output_text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I|re.S)
-    return json.loads(text)
+    return call_ai_json(client, model, prompt)
 
 # ---------------- 네이버 API ----------------
 def naver_signature(timestamp, method, uri, secret_key):
@@ -279,18 +277,59 @@ def naver_headers(method, uri, api_key, secret_key, customer_id):
         "Content-Type":"application/json; charset=UTF-8",
     }
 
+def prepare_naver_seed(seed):
+    """네이버 키워드도구 요청용: 공백/제어문자 및 지원하지 않는 기호 제거."""
+    original = clean(seed)
+    normalized = re.sub(r"\s+", "", original)
+    normalized = re.sub(r"[^가-힣ㄱ-ㅎㅏ-ㅣA-Za-z0-9]", "", normalized)
+    if not normalized:
+        raise ValueError(f"조회 가능한 문자가 없는 기준키워드: {original!r}")
+    if len(normalized) > 25:
+        raise ValueError(f"기준키워드가 너무 깁니다(25자 초과): {original!r}")
+    return normalized
+
+
+def call_ai_json(client, model, prompt, attempts=3):
+    """429 / 일시적 네트워크 오류를 재시도하고 JSON 결과를 반환."""
+    for attempt in range(attempts):
+        try:
+            response = client.responses.create(model=model, input=prompt)
+            content = response.output_text.strip()
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S)
+            return json.loads(content)
+        except (RateLimitError, APIConnectionError, APITimeoutError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(min(30, 3 * (2 ** attempt)) + random.uniform(0, 0.5))
+        except json.JSONDecodeError:
+            if attempt == attempts - 1:
+                raise RuntimeError("AI 응답 JSON 형식이 올바르지 않습니다. 다시 시도해 주세요.")
+            time.sleep(1)
+
+
 def naver_keyword_tool(seed, api_key, secret_key, customer_id):
     uri = "/keywordstool"
-    r = requests.get(
-        NAVER_API_BASE + uri,
-        headers=naver_headers("GET", uri, api_key, secret_key, customer_id),
-        params={"hintKeywords": seed, "showDetail":"1"},
-        timeout=20,
-    )
-    if r.status_code == 429:
-        raise RuntimeError("네이버 API 호출량 제한(429)입니다.")
+    original_seed = clean(seed)
+    api_seed = prepare_naver_seed(seed)
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                NAVER_API_BASE + uri,
+                headers=naver_headers("GET", uri, api_key, secret_key, customer_id),
+                params={"hintKeywords": api_seed, "showDetail": "1"}, timeout=20,
+            )
+        except requests.RequestException as exc:
+            if attempt == 2:
+                raise RuntimeError(f"네이버 연결 실패: {exc}") from exc
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+            time.sleep(2 ** attempt + 1)
+            continue
+        break
     if r.status_code >= 400:
-        raise RuntimeError(f"네이버 API 오류 {r.status_code}: {r.text[:300]}")
+        detail = r.text[:300]
+        raise RuntimeError(f"네이버 API 오류 {r.status_code} (전송값: {api_seed}): {detail}")
     out = []
     for x in r.json().get("keywordList", []):
         out.append({
@@ -301,7 +340,7 @@ def naver_keyword_tool(seed, api_key, secret_key, customer_id):
             "모바일월평균클릭수": x.get("monthlyAveMobileClkCnt"),
             "경쟁정도": x.get("compIdx"),
             "평균광고수": x.get("plAvgDepth"),
-            "기준키워드": seed,
+            "기준키워드": original_seed,
         })
     return pd.DataFrame(out)
 
@@ -344,8 +383,10 @@ def normalize_naver_raw(frames, selected_seeds):
         "PC월간검색수":"first","모바일월간검색수":"first",
         "PC월평균클릭수":"first","모바일월평균클릭수":"first",
         "경쟁정도":"first","평균광고수":"first",
-        "총검색수":"sum",
+        "총검색수":"max",
     }
+    if df.empty:
+        return df
     return df.groupby("키워드", as_index=False).agg(agg)
 
 # ---------------- AI 2차 검수 ----------------
@@ -357,8 +398,9 @@ def ai_review_keywords(openai_key, model, ai_site_result, selected_seeds, naver_
     ]].to_dict("records")
 
     # 너무 많은 경우 청크 처리
-    chunk_size = 120
+    chunk_size = 40
     reviewed = []
+    failed_chunks = []
 
     for start in range(0, len(records), chunk_size):
         chunk = records[start:start+chunk_size]
@@ -417,17 +459,26 @@ def ai_review_keywords(openai_key, model, ai_site_result, selected_seeds, naver_
 NAVER_KEYWORDS:
 {json.dumps(chunk, ensure_ascii=False)}
 """
-        resp = client.responses.create(model=model, input=prompt)
-        text = resp.output_text.strip()
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I|re.S)
-        data = json.loads(text)
-        reviewed.extend(data.get("results", []))
+        try:
+            data = call_ai_json(client, model, prompt)
+            valid_keywords = {row["키워드"] for row in chunk}
+            for item in data.get("results", []):
+                if item.get("keyword") in valid_keywords:
+                    reviewed.append(item)
+        except Exception as exc:
+            failed_chunks.append(f"{start + 1}~{start + len(chunk)}: {type(exc).__name__}")
+            for row in chunk:
+                reviewed.append({"keyword": row["키워드"], "status": "검토",
+                                 "reason": "AI 호출 실패로 수동 검토 필요"})
+    if failed_chunks:
+        st.warning("일부 AI 검수 요청이 실패해 해당 키워드를 '검토'로 보존했습니다: " + "; ".join(failed_chunks[:10]))
 
     review_df = pd.DataFrame(reviewed)
     if review_df.empty:
         return pd.DataFrame()
 
     review_df = review_df.rename(columns={"keyword":"키워드","status":"AI판정","reason":"AI판정이유"})
+    review_df = review_df.drop_duplicates(subset=["키워드"], keep="first")
     merged = naver_df.merge(review_df, on="키워드", how="left")
     merged["AI판정"] = merged["AI판정"].fillna("검토")
     merged["AI판정이유"] = merged["AI판정이유"].fillna("AI 응답 누락으로 수동 검토 필요")
@@ -486,14 +537,14 @@ for k,v in {
     if k not in st.session_state:
         st.session_state[k]=v
 
-st.title("🤖 AI 검색광고 키워드 추출기 v8")
+st.title("🤖 AI 검색광고 키워드 추출기 v9")
 st.write("네이버 키워드 도구 결과를 **AI가 한 번 더 광고 적합성 검수**한 뒤, 적합한 키워드만 조합기로 넘깁니다.")
 
 with st.expander("🔐 API 연결 설정", expanded=True):
     a,b = st.columns(2)
     with a:
         openai_key = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
-        model = st.text_input("OpenAI 모델", value="gpt-6-luna")
+        model = st.text_input("OpenAI 모델", value="gpt-4.1-mini", help="API 계정에서 사용 가능한 모델명으로 바꿀 수 있습니다.")
     with b:
         naver_api_key = st.text_input("네이버 Access License / API Key", type="password", value=st.session_state["naver_api_key"])
         naver_secret_key = st.text_input("네이버 Secret Key", type="password", value=st.session_state["naver_secret_key"])
@@ -559,21 +610,35 @@ if ai:
             st.session_state["naver_customer_id"] = naver_customer_id
 
             frames, errors = [], []
+            seed_map = {}
+            for original in seeds:
+                try:
+                    normalized = prepare_naver_seed(original)
+                    seed_map.setdefault(normalized, original)
+                except ValueError as exc:
+                    errors.append(str(exc))
+            unique_seeds = list(seed_map.values())
+            if not unique_seeds:
+                st.error("조회 가능한 기준키워드가 없습니다. 입력을 수정해 주세요.")
+                st.stop()
+            st.caption(f"입력 {len(seeds)}개 → 공백·특수문자 정규화 및 중복 제거 후 실제 조회 {len(unique_seeds)}개")
             p = st.progress(0, text="네이버 키워드 도구 조회 중...")
-            for i, seed in enumerate(seeds):
+            for i, seed in enumerate(unique_seeds):
                 try:
                     frames.append(naver_keyword_tool(seed, naver_api_key, naver_secret_key, naver_customer_id))
                     time.sleep(0.12)
                 except Exception as e:
                     errors.append(f"{seed}: {e}")
-                p.progress(int((i+1)/len(seeds)*100))
+                p.progress(int((i+1)/len(unique_seeds)*100))
 
             if frames:
                 raw = normalize_naver_raw(frames, seeds)
                 st.session_state["naver_raw"] = raw
                 st.success(f"네이버 후보 {len(raw):,}개 수집 완료")
             if errors:
-                st.warning("\n".join(errors[:5]))
+                st.warning("일부 조회 실패 (아래에서 전체 오류 확인 가능)")
+                with st.expander(f"오류 상세 {len(errors)}건"):
+                    st.text("\n".join(errors))
 
 naver_raw = st.session_state.get("naver_raw")
 if isinstance(naver_raw, pd.DataFrame) and not naver_raw.empty:
@@ -612,7 +677,7 @@ if isinstance(reviewed, pd.DataFrame) and not reviewed.empty:
         )
 
         industry = ai.get("industry","기타")
-        mods = INDUSTRY_MODIFIERS.get(industry, INDUSTRY_MODIFIERS["기타"])
+        mods = next((v for k, v in INDUSTRY_MODIFIERS.items() if k in industry or industry in k), INDUSTRY_MODIFIERS["기타"])
         modifier_text = st.text_area("추천 조합어", value=", ".join(mods), height=75)
         region_text = st.text_area("지역 조합어 (선택)", placeholder="서울, 경기, 인천, 수원, 용인", height=65)
         direction = st.radio("조합 방향", ["앞조합","뒤조합","앞+뒤 모두"], horizontal=True, index=2)
@@ -640,11 +705,12 @@ if isinstance(combo, pd.DataFrame) and not combo.empty:
     st.markdown("#### 조합 결과")
     st.dataframe(combo, use_container_width=True, height=420)
 
+if isinstance(reviewed, pd.DataFrame) and not reviewed.empty:
     xlsx = export_excel(ai, reviewed, combo)
     st.download_button(
         "📥 최종 Excel 다운로드",
         data=xlsx,
-        file_name="AI_검색광고_키워드_v8.xlsx",
+        file_name="AI_검색광고_키워드_v9.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
